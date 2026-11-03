@@ -2,12 +2,16 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -69,6 +73,10 @@ func MigrationVersion(databaseURL string) (version uint, dirty bool, err error) 
 }
 
 func newMigrator(databaseURL string) (*migrate.Migrate, error) {
+	if IsSQLiteURL(databaseURL) {
+		return newSQLiteMigrator(databaseURL)
+	}
+
 	src, err := iofs.New(sorovault.Migrations, "migrations")
 	if err != nil {
 		return nil, fmt.Errorf("store: reading embedded migrations: %w", err)
@@ -84,6 +92,34 @@ func newMigrator(databaseURL string) (*migrate.Migrate, error) {
 	return m, nil
 }
 
+func newSQLiteMigrator(databaseURL string) (*migrate.Migrate, error) {
+	src, err := iofs.New(sorovault.Migrations, "migrations/sqlite")
+	if err != nil {
+		return nil, fmt.Errorf("store: reading embedded sqlite migrations: %w", err)
+	}
+
+	db, err := openSQLiteDB(context.Background(), databaseURL)
+	if err != nil {
+		_ = src.Close()
+		return nil, fmt.Errorf("store: preparing sqlite migrations: %w", err)
+	}
+
+	driver, err := sqlite.WithInstance(db, &sqlite.Config{})
+	if err != nil {
+		_ = db.Close()
+		_ = src.Close()
+		return nil, fmt.Errorf("store: preparing sqlite migrations: %w", err)
+	}
+
+	m, err := migrate.NewWithInstance("iofs", src, "sqlite", driver)
+	if err != nil {
+		_ = db.Close()
+		_ = src.Close()
+		return nil, fmt.Errorf("store: preparing sqlite migrations: %w", err)
+	}
+	return m, nil
+}
+
 // MigrationStatus reports the migration version the database has applied,
 // the latest version among the embedded migrations, and whether the database
 // is marked dirty.
@@ -93,6 +129,10 @@ func newMigrator(databaseURL string) (*migrate.Migrate, error) {
 // check that only reads must not leave a table behind. A database with no
 // version table has had no migration applied, which is version zero.
 func MigrationStatus(ctx context.Context, databaseURL string) (current, latest uint, dirty bool, err error) {
+	if IsSQLiteURL(databaseURL) {
+		return sqliteMigrationStatus(ctx, databaseURL)
+	}
+
 	latest, err = LatestMigrationVersion()
 	if err != nil {
 		return 0, 0, false, err
@@ -121,6 +161,50 @@ func MigrationStatus(ctx context.Context, databaseURL string) (current, latest u
 	return current, latest, dirty, nil
 }
 
+func sqliteMigrationStatus(ctx context.Context, databaseURL string) (current, latest uint, dirty bool, err error) {
+	migrations, err := EmbeddedSQLiteMigrations()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(migrations) == 0 {
+		return 0, 0, false, errors.New("store: no embedded sqlite migrations")
+	}
+	latest = migrations[len(migrations)-1].Version
+
+	path, _, err := parseSQLiteURL(databaseURL)
+	if err != nil {
+		return 0, latest, false, err
+	}
+	if path != "" {
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			return 0, latest, false, nil
+		}
+	}
+
+	db, err := openSQLiteDB(ctx, databaseURL)
+	if err != nil {
+		return 0, latest, false, err
+	}
+	defer func() { _ = db.Close() }()
+
+	const q = `SELECT version, dirty FROM schema_migrations LIMIT 1`
+	var version int64
+	err = db.QueryRowContext(ctx, q).Scan(&version, &dirty)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, latest, false, nil
+	case err != nil:
+		if strings.Contains(strings.ToLower(err.Error()), "no such table: schema_migrations") {
+			return 0, latest, false, nil
+		}
+		return 0, latest, false, fmt.Errorf("store: reading sqlite migration version: %w", err)
+	}
+	if version < 0 {
+		return 0, latest, dirty, nil
+	}
+	return uint(version), latest, dirty, nil
+}
+
 // LatestMigrationVersion reports the highest version among the embedded
 // migrations.
 //
@@ -146,15 +230,34 @@ type Migration struct {
 	Name string
 }
 
-// EmbeddedMigrations lists the migrations embedded in the binary, oldest
-// first.
+// EmbeddedMigrations lists the Postgres migrations embedded in the binary,
+// oldest first.
 //
 // The list comes from golang-migrate's own source, so the file naming
 // convention and the ordering stay in one place, and a migrations directory
 // the migrator would refuse — a duplicate version, say — is refused here
 // too rather than quietly listed.
 func EmbeddedMigrations() ([]Migration, error) {
-	src, err := iofs.New(sorovault.Migrations, "migrations")
+	return embeddedMigrationsIn("migrations")
+}
+
+// EmbeddedSQLiteMigrations lists the SQLite migrations embedded in the binary,
+// oldest first.
+func EmbeddedSQLiteMigrations() ([]Migration, error) {
+	return embeddedMigrationsIn("migrations/sqlite")
+}
+
+// EmbeddedMigrationsFor lists the embedded migrations for the dialect selected
+// by databaseURL.
+func EmbeddedMigrationsFor(databaseURL string) ([]Migration, error) {
+	if IsSQLiteURL(databaseURL) {
+		return EmbeddedSQLiteMigrations()
+	}
+	return EmbeddedMigrations()
+}
+
+func embeddedMigrationsIn(dir string) ([]Migration, error) {
+	src, err := iofs.New(sorovault.Migrations, dir)
 	if err != nil {
 		return nil, fmt.Errorf("store: reading embedded migrations: %w", err)
 	}

@@ -1,0 +1,2 @@
+ALTER TABLE contracts ADD COLUMN source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE contracts ADD COLUMN source_commit TEXT NOT NULL DEFAULT '';

@@ -99,6 +99,9 @@ func NewPostgresFromPool(pool *pgxpool.Pool) *Postgres {
 // It opens nothing but a connection and changes nothing, so a health check
 // can use it without leaving a trace.
 func Ping(ctx context.Context, databaseURL string) error {
+	if IsSQLiteURL(databaseURL) {
+		return pingSQLite(ctx, databaseURL)
+	}
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return fmt.Errorf("store: connecting to postgres: %w", err)

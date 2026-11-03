@@ -192,6 +192,17 @@ For production deployment — sizing, backups, upgrades and monitoring — see
 
 ### Running locally
 
+For single-user or local deployments, point `DATABASE_URL` at a SQLite file — no external database server or C toolchain is needed (`modernc.org/sqlite` is pure Go):
+
+```console
+$ export DATABASE_URL=sqlite:///tmp/registry.db
+$ go run ./cmd/sorovault migrate
+$ go run ./cmd/sorovault add CDZZXVGUCLBUTE3WDD6TF2NXPTBPOYTVPPBBIZMSPVIQLUG226XJ4PAN
+$ go run ./cmd/sorovault serve
+```
+
+Or run against Postgres via Docker Compose:
+
 ```console
 $ cp .env.example .env          # adjust as needed
 $ set -a && source .env && set +a
@@ -236,7 +247,7 @@ back out of what it became. `--json` prints the same rows for scripts.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | — | Postgres connection string. **Required** (or set `DATABASE_URL_FILE` to read it from a file). |
+| `DATABASE_URL` | — | Postgres connection string (`postgres://…`) or SQLite file URL (`sqlite:///path/registry.db`). **Required** (or set `DATABASE_URL_FILE` to read it from a file). |
 | `MAX_CONCURRENT_REGISTRATIONS` | `4` | how many registrations and refreshes run at once |
 | `DATABASE_MAX_CONNS` | pgx's own (the greater of 4 or the CPU count) | most connections the pool holds open |
 | `DATABASE_MIN_CONNS` | `0` | connections the pool keeps open between requests |
@@ -700,6 +711,8 @@ documentation matched.
 
 A function removed by an upgrade stops matching; older versions stay
 retrievable by hash but are not searched.
+
+On Postgres, doc-comment search is backed by a GIN `tsvector` index (`to_tsvector('simple', …)`) and symbol/exact-name filters run in SQL over `ILIKE` and `jsonb` predicates. On SQLite (`DATABASE_URL=sqlite:///path/registry.db`), `specs` stores the newline-joined symbol list, doc text, and ABI JSON as `TEXT` without requiring FTS5 or C extensions, and evaluates the same case-insensitive symbol substring match, lowercased alphanumeric prefix doc-word match, and exact function/type/standard filters in process after narrowing by network. Both backends pass the same store conformance and search fuzz suites.
 
 **Exact names.** `?q=` is a substring, so `?q=transfer` also finds
 `transfer_from` and `transferable`. When a tool wants the contracts that

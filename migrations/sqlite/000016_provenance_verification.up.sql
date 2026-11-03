@@ -1,0 +1,5 @@
+ALTER TABLE contracts ADD COLUMN creator TEXT NOT NULL DEFAULT '';
+ALTER TABLE contracts ADD COLUMN created_ledger INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE contracts ADD COLUMN verified_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE contracts ADD COLUMN verified_at TEXT;
+ALTER TABLE contracts ADD COLUMN verified_wasm_hash TEXT NOT NULL DEFAULT '';

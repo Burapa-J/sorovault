@@ -46,7 +46,12 @@ func FuzzListQuery(f *testing.F) {
 	ctx := context.Background()
 	const networkPrefix = "fuzz-list-query"
 	network := fmt.Sprintf("%s-%d", networkPrefix, os.Getpid())
-	stores := []store.Store{store.NewMemory()}
+	sqliteURL := store.SQLiteURLPrefix + f.TempDir() + "/fuzz.db"
+	require.NoError(f, store.Migrate(sqliteURL))
+	sqliteStore, err := store.NewSQLite(ctx, sqliteURL)
+	require.NoError(f, err)
+	f.Cleanup(func() { _ = sqliteStore.Close() })
+	stores := []store.Store{store.NewMemory(), sqliteStore}
 
 	if url := os.Getenv(TestDatabaseURLEnv); url != "" {
 		require.NoError(f, store.Migrate(url))

@@ -846,7 +846,7 @@ func migrateStatusDepsFromEnv() (migrateStatusDeps, error) {
 			return store.MigrationVersion(databaseURL)
 		},
 		Migrations: func(context.Context) ([]store.Migration, error) {
-			return store.EmbeddedMigrations()
+			return store.EmbeddedMigrationsFor(databaseURL)
 		},
 	}, nil
 }

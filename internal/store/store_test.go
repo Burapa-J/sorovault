@@ -33,6 +33,7 @@ func TestStore(t *testing.T) {
 
 	impls := map[string]factory{
 		"memory": func(t *testing.T) store.Store { return store.NewMemory() },
+		"sqlite": newSQLiteStore,
 	}
 	if url := os.Getenv(TestDatabaseURLEnv); url != "" {
 		impls["postgres"] = postgresFactory(t, url)

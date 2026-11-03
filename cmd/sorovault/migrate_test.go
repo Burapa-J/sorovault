@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -301,4 +302,34 @@ func TestMigrateAppliesMigrations(t *testing.T) {
 
 	counts := tableCounts(t, scoped)
 	assert.Contains(t, counts, "contracts", "the migrations should have been applied")
+}
+
+func TestMigrateAndStatusWithSQLiteDatabaseURL(t *testing.T) {
+	url := store.SQLiteURLPrefix + filepath.ToSlash(filepath.Join(t.TempDir(), "registry.db"))
+	t.Setenv("DATABASE_URL", url)
+	t.Setenv("DATABASE_URL_FILE", "")
+
+	// Before running migrate, status reports current version 0 and exits non-zero.
+	statusCmd := newMigrateStatusCmd(migrateStatusDepsFromEnv)
+	var statusBefore bytes.Buffer
+	statusCmd.SetOut(&statusBefore)
+	statusCmd.SetErr(&statusBefore)
+	require.Error(t, statusCmd.Execute())
+	assert.Contains(t, statusBefore.String(), "current version: 0")
+
+	// Running `sorovault migrate` applies all SQLite migrations.
+	migrateCmd := newMigrateCmd()
+	var migrateOut bytes.Buffer
+	migrateCmd.SetOut(&migrateOut)
+	migrateCmd.SetErr(&migrateOut)
+	require.NoError(t, migrateCmd.Execute())
+	assert.Contains(t, migrateOut.String(), "database is at migration version")
+
+	// After running migrate, status reports up to date and exits zero.
+	statusCmdAfter := newMigrateStatusCmd(migrateStatusDepsFromEnv)
+	var statusAfter bytes.Buffer
+	statusCmdAfter.SetOut(&statusAfter)
+	statusCmdAfter.SetErr(&statusAfter)
+	require.NoError(t, statusCmdAfter.Execute())
+	assert.Contains(t, statusAfter.String(), "the database is up to date")
 }
