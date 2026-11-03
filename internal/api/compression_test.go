@@ -62,6 +62,12 @@ func TestCompressResponses(t *testing.T) {
 			contentType: "image/png",
 			body:        large,
 		},
+		{
+			name:        "an event stream is never compressed",
+			accept:      "gzip",
+			contentType: "text/event-stream",
+			body:        large,
+		},
 	}
 
 	for _, tt := range tests {

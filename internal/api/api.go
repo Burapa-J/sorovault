@@ -42,12 +42,19 @@ import (
 	"github.com/soroworks/sorovault/internal/wasm"
 )
 
+// defaultStreamHeartbeat is how often an idle SSE stream emits a comment to
+// keep intermediate proxies from closing the connection.
+const defaultStreamHeartbeat = 15 * time.Second
+
 // Server holds the API's dependencies.
 type Server struct {
 	reg       *registry.Registry
 	log       *slog.Logger
 	cache     *interfaceCache
 	rateLimit *clientLimiter
+
+	broker          *refresher.Broker
+	streamHeartbeat time.Duration
 
 	// lastSweep, when set, reports the most recent automatic refresh
 	// sweep. It is nil when refresh is disabled, and GET /api/stats then
@@ -74,7 +81,42 @@ func NewServer(reg *registry.Registry, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{reg: reg, log: log, cache: newInterfaceCache(interfaceCacheBytes)}
+	return &Server{
+		reg:             reg,
+		log:             log,
+		cache:           newInterfaceCache(interfaceCacheBytes),
+		broker:          refresher.NewBroker(0, 0),
+		streamHeartbeat: defaultStreamHeartbeat,
+	}
+}
+
+// SetBroker attaches the upgrade fan-out broker that backs GET /api/upgrades/stream.
+// A nil broker is ignored so the server always has one.
+func (s *Server) SetBroker(b *refresher.Broker) {
+	if b != nil {
+		s.broker = b
+	}
+}
+
+// Broker returns the server's upgrade fan-out broker.
+func (s *Server) Broker() *refresher.Broker {
+	return s.broker
+}
+
+// SetStreamMaxSubscribers configures the maximum number of concurrent SSE
+// clients on GET /api/upgrades/stream.
+func (s *Server) SetStreamMaxSubscribers(maxSubscribers int) {
+	if s.broker != nil {
+		s.broker.SetMaxSubscribers(maxSubscribers)
+	}
+}
+
+// SetStreamHeartbeat configures how often an idle SSE connection emits a
+// heartbeat comment. Non-positive values are ignored.
+func (s *Server) SetStreamHeartbeat(d time.Duration) {
+	if d > 0 {
+		s.streamHeartbeat = d
+	}
 }
 
 // SetReadOnly makes the server's write routes refuse with 405 instead of
@@ -153,6 +195,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/keys", s.getKeys)
 	r.Get("/stats", s.getStats)
 	r.Get("/upgrades", s.listUpgrades)
+	r.Get("/upgrades/stream", s.streamUpgrades)
 	r.Get("/upgrades.atom", s.upgradesAtom)
 	r.Get("/openapi.json", serveOpenAPI)
 	r.Post("/subscriptions", s.write(s.subscribeContract))
@@ -885,11 +928,20 @@ func compressResponses(types ...string) func(http.Handler) http.Handler {
 			}
 
 			buffer := newResponseBuffer()
-			next.ServeHTTP(buffer, r)
+			buffer.dst = w
+			var writer http.ResponseWriter = buffer
+			if flusher, ok := w.(http.Flusher); ok {
+				writer = &flushResponseBuffer{responseBuffer: buffer, flusher: flusher}
+			}
+			next.ServeHTTP(writer, r)
+
+			if buffer.streamed {
+				return
+			}
 
 			contentType, _, _ := strings.Cut(buffer.Header().Get("Content-Type"), ";")
 			_, allowed := compressible[contentType]
-			if buffer.body.Len() < minCompressBytes || !allowed ||
+			if contentType == "text/event-stream" || buffer.body.Len() < minCompressBytes || !allowed ||
 				buffer.Header().Get("Content-Encoding") != "" {
 				buffer.writeTo(w)
 				return
@@ -925,12 +977,25 @@ func acceptsGzip(header string) bool {
 }
 
 // responseBuffer records a response so compression can be decided once its
-// full size is known.
+// full size is known. When Flush is called, it switches to streaming directly
+// to dst so Server-Sent Events are never buffered or compressed.
 type responseBuffer struct {
+	dst         http.ResponseWriter
 	header      http.Header
 	status      int
 	body        bytes.Buffer
 	wroteHeader bool
+	streamed    bool
+}
+
+type flushResponseBuffer struct {
+	*responseBuffer
+	flusher http.Flusher
+}
+
+func (b *flushResponseBuffer) Flush() {
+	b.flushToUnderlying()
+	b.flusher.Flush()
 }
 
 func newResponseBuffer() *responseBuffer {
@@ -951,7 +1016,25 @@ func (b *responseBuffer) Write(p []byte) (int, error) {
 	if !b.wroteHeader {
 		b.WriteHeader(http.StatusOK)
 	}
+	if b.streamed && b.dst != nil {
+		return b.dst.Write(p)
+	}
 	return b.body.Write(p)
+}
+
+func (b *responseBuffer) flushToUnderlying() {
+	if b.dst == nil {
+		return
+	}
+	if !b.streamed {
+		b.streamed = true
+		copyHeader(b.dst.Header(), b.header)
+		b.dst.WriteHeader(b.status)
+	}
+	if b.body.Len() > 0 {
+		_, _ = b.dst.Write(b.body.Bytes())
+		b.body.Reset()
+	}
 }
 
 func (b *responseBuffer) writeTo(w http.ResponseWriter) {
@@ -1043,6 +1126,180 @@ func (s *Server) listUpgrades(w http.ResponseWriter, r *http.Request) {
 		Total:    page.Total,
 		Limit:    filter.Limit,
 		Offset:   filter.Offset,
+	})
+}
+
+// UpgradeEventID returns the stable Server-Sent Events identifier for an
+// interface upgrade. Passing it back in Last-Event-ID on reconnect replays
+// every upgrade observed since.
+func UpgradeEventID(u store.Upgrade) string {
+	return fmt.Sprintf("urn:sorovault:upgrade:%s:%s:%s", u.Network, u.ContractID, u.NewWasmHash)
+}
+
+func matchesUpgradeEventID(u store.Upgrade, lastEventID string) bool {
+	switch lastEventID {
+	case UpgradeEventID(u),
+		fmt.Sprintf("%s:%s:%s", u.Network, u.ContractID, u.NewWasmHash),
+		fmt.Sprintf("%s:%s", u.ContractID, u.NewWasmHash),
+		u.NewWasmHash,
+		u.ObservedAt.UTC().Format(time.RFC3339Nano),
+		u.ObservedAt.UTC().Format(time.RFC3339):
+		return true
+	default:
+		return false
+	}
+}
+
+// streamUpgrades serves GET /api/upgrades/stream as Server-Sent Events.
+func (s *Server) streamUpgrades(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	network := strings.TrimSpace(q.Get("network"))
+	contractID := strings.TrimSpace(q.Get("contract_id"))
+	if contractID != "" {
+		if err := stellar.ValidateContractID(contractID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	filter := refresher.StreamFilter{
+		Network:    network,
+		ContractID: contractID,
+	}
+	sub, err := s.broker.Subscribe(filter)
+	if err != nil {
+		if errors.Is(err, refresher.ErrTooManySubscribers) {
+			w.Header().Set("Retry-After", "5")
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		s.fail(w, r, err)
+		return
+	}
+	defer sub.Close()
+
+	var missed []store.Upgrade
+	lastEventID := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if lastEventID != "" {
+		missed, err = s.missedUpgrades(r, filter, lastEventID)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	replayed := make(map[string]struct{}, len(missed))
+	for _, u := range missed {
+		id := UpgradeEventID(u)
+		replayed[id] = struct{}{}
+		if !writeUpgradeSSE(w, u) {
+			return
+		}
+	}
+	flusher.Flush()
+
+	heartbeat := s.streamHeartbeat
+	if heartbeat <= 0 {
+		heartbeat = defaultStreamHeartbeat
+	}
+	beat := time.NewTicker(heartbeat)
+	defer beat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-beat.C:
+			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case u := <-sub.C:
+			id := UpgradeEventID(u)
+			if _, seen := replayed[id]; seen {
+				delete(replayed, id)
+				continue
+			}
+			if !writeUpgradeSSE(w, u) {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) missedUpgrades(r *http.Request, filter refresher.StreamFilter, lastEventID string) ([]store.Upgrade, error) {
+	const maxReplayPages = 10
+	var collected []store.Upgrade
+	found := false
+
+	for pageIdx := range maxReplayPages {
+		page, err := s.reg.Store().ListUpgrades(r.Context(), store.UpgradeFilter{
+			Network: filter.Network,
+			Limit:   store.MaxLimit,
+			Offset:  pageIdx * store.MaxLimit,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, u := range page.Upgrades {
+			if matchesUpgradeEventID(u, lastEventID) {
+				found = true
+				break
+			}
+			if filter.Matches(u) {
+				collected = append(collected, u)
+			}
+		}
+		if found || len(page.Upgrades) == 0 || (pageIdx+1)*store.MaxLimit >= page.Total {
+			break
+		}
+	}
+
+	if !found {
+		return nil, nil
+	}
+
+	for i, j := 0, len(collected)-1; i < j; i, j = i+1, j-1 {
+		collected[i], collected[j] = collected[j], collected[i]
+	}
+	return collected, nil
+}
+
+func writeUpgradeSSE(w http.ResponseWriter, u store.Upgrade) bool {
+	data, err := json.Marshal(u)
+	if err != nil {
+		return false
+	}
+	_, err = fmt.Fprintf(w, "id: %s\nevent: upgrade\ndata: %s\n\n", UpgradeEventID(u), data)
+	return err == nil
+}
+
+func (s *Server) publishUpgrade(result *registry.Result) {
+	if s.broker == nil || result == nil || !result.Changed || result.Created {
+		return
+	}
+	observedAt := result.Contract.LastRefreshed.UTC()
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	s.broker.Publish(store.Upgrade{
+		ContractID:  result.Contract.ContractID,
+		Network:     result.Contract.Network,
+		OldWasmHash: result.PreviousWasmHash,
+		NewWasmHash: result.Contract.CurrentWasmHash,
+		ObservedAt:  observedAt,
 	})
 }
 
@@ -1446,6 +1703,7 @@ func (s *Server) registerContract(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.publishUpgrade(result)
 
 	status := http.StatusOK
 	if result.Created {
@@ -1525,6 +1783,7 @@ func (s *Server) registerOne(r *http.Request, contractID string) batchResult {
 			Error:      message,
 		}
 	}
+	s.publishUpgrade(result)
 
 	status := batchStatusUnchanged
 	switch {
@@ -1551,6 +1810,7 @@ func (s *Server) refreshContract(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.publishUpgrade(result)
 	writeJSON(w, http.StatusOK, result)
 }
 

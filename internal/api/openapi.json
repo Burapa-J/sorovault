@@ -506,6 +506,23 @@
         }
       }
     },
+    "/api/upgrades/stream": {
+      "get": {
+        "summary": "Stream interface upgrades as server-sent events",
+        "description": "Sends each recorded interface upgrade as a `text/event-stream` `upgrade` event with a JSON `Upgrade` payload. Reconnecting with `Last-Event-ID` replays any upgrades observed after that event.",
+        "operationId": "streamUpgrades",
+        "parameters": [
+          { "$ref": "#/components/parameters/network" },
+          { "name": "contract_id", "in": "query", "description": "Only stream upgrades for this contract ID.", "schema": { "$ref": "#/components/schemas/ContractID" } },
+          { "name": "Last-Event-ID", "in": "header", "description": "Event ID of the last upgrade received; missed upgrades after it are replayed in chronological order before live streaming begins.", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "A stream of server-sent upgrade events.", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
     "/api/upgrades.atom": {
       "get": {
         "summary": "Recent interface upgrades as an Atom feed",

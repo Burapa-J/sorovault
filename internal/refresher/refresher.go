@@ -47,6 +47,9 @@ type Options struct {
 	// Notifier, when set, is told about every contract whose interface
 	// changed during a sweep. Delivery is best effort.
 	Notifier Notifier
+	// Broker, when set, fans upgrade events out to in-process SSE
+	// subscribers. When nil, New creates one with default limits.
+	Broker *Broker
 	// Logger receives one line per sweep and one per failure. Defaults to
 	// slog.Default.
 	Logger *slog.Logger
@@ -70,6 +73,7 @@ type Refresher struct {
 	interval time.Duration
 	timeout  time.Duration
 	notifier Notifier
+	broker   *Broker
 	log      *slog.Logger
 	now      func() time.Time
 	wait     func(context.Context, time.Duration) error
@@ -103,6 +107,10 @@ func New(reg Registry, opts Options) (*Refresher, error) {
 	if eventsInterval <= 0 {
 		eventsInterval = defaultEventsInterval
 	}
+	broker := opts.Broker
+	if broker == nil {
+		broker = NewBroker(0, 0)
+	}
 	return &Refresher{
 		events:         opts.Events,
 		eventsInterval: eventsInterval,
@@ -110,10 +118,16 @@ func New(reg Registry, opts Options) (*Refresher, error) {
 		interval:       opts.Interval,
 		timeout:        opts.Timeout,
 		notifier:       opts.Notifier,
+		broker:         broker,
 		log:            log,
 		now:            now,
 		wait:           wait,
 	}, nil
+}
+
+// Broker returns the in-process upgrade fan-out broker.
+func (r *Refresher) Broker() *Broker {
+	return r.broker
 }
 
 // SweepRecord is what the most recent completed sweep did and when it
@@ -372,6 +386,20 @@ func (r *Refresher) recordRefresh(ctx context.Context, network string, contract 
 // keep the registry up to date, and how fast a receiver reads about it is
 // the receiver's business.
 func (r *Refresher) notify(ctx context.Context, network string, result *registry.Result) {
+	observedAt := result.Contract.LastRefreshed.UTC()
+	if observedAt.IsZero() {
+		observedAt = r.now().UTC()
+	}
+	if r.broker != nil {
+		r.broker.Publish(store.Upgrade{
+			ContractID:  result.Contract.ContractID,
+			Network:     network,
+			OldWasmHash: result.PreviousWasmHash,
+			NewWasmHash: result.Contract.CurrentWasmHash,
+			ObservedAt:  observedAt,
+		})
+	}
+
 	change := Change{
 		ContractID:   result.Contract.ContractID,
 		Network:      network,
